@@ -6,67 +6,82 @@ use Net::SNMP;
 use Net::SNMP::Mixin qw/mixer init_mixins/;
 use DBI;
 use Getopt::Long;
-use Term::ReadLine;
 
-sub prepare_db ();
+sub prepare_db ($);
 sub load_tables ($@);
-sub interact ($);
-sub dump_tables ($$);
-sub find_macs ($$$;$);
-sub query_macs ($$$);
+sub query_tables ($$$%);
 
 my $quiet;
 my $verbose;
-my $dump;
+my $noheader;
 my $macs;
+my $ports;
+my $vlans;
+my $exclude_ports;
+my $cache_file;
 Getopt::Long::Configure('bundling');
 GetOptions(
-	'q|quiet+' => \$quiet,
+	'q|quiet' => \$quiet,
 	'v|verbose' => \$verbose,
-	'dump' => \$dump,
+	'Q|noheader' => \$noheader,
 	'm|mac:s@' => \$macs,
+	'p|port:s@' => \$ports,
+	'l|vlan:s@' => \$vlans,
+	'P|exclude-port=s@' => \$exclude_ports,
+	'c|cache=s' => \$cache_file,
 ) or die "Invalid argument(s)\n";
 
 unless (scalar @ARGV >= 1) {
 	die <<EOM;
 usage: $0 [options] hostname [hostname...]
- -q,--quiet            Silence all unnecessary output
- -v,--verbose          Additional output
- --dump                Dump entire tables in CSV
- -m,--macs [mac,mac]   Search for the specified mac.
-                       Reads from stdin if none specified.
+ -q,--quiet           Silence all unnecessary output
+ -v,--verbose         Additional output
+ -Q,--noheader        Don't add header lines to output
+ -m,--mac [mac,...]   Filter output to the specified mac(s).
+                      Reads macs from stdin if none specified.
+ -p,--port [port,...] Filter output to the specified port(s).
+                      Reads ports from stdin if none specified.
+ -l,--vlan [vlan,...] Filter output to the specified vlan(s).
+                      Reads vlans from stdin if none specified.
+ -P,--exclude-port [host:port,...]
+                      Exclude the specified host:port combination(s) from output
+ -c,--cache file      Read from cached data (or create if not present)
+
+If many are filters are without arguments then the values read from stdin must
+be comma separated and in the order 'mac,port,vlan'.
+
 EOM
 }
 
 $quiet and undef $verbose;
+@$macs = split(/,/, join(',', @$macs)) if defined $macs;
+@$ports = split(/,/, join(',', @$ports)) if defined $ports;
+@$vlans = split(/,/, join(',', @$vlans)) if defined $vlans;
+@$exclude_ports = split(/,/, join(',', @$exclude_ports))
+	if defined $exclude_ports;
 
 
-my $dbh = prepare_db();
+my $was_cached = 1 if $cache_file and -f $cache_file;
+$cache_file ||= '';
+my $dbh = DBI->connect("dbi:SQLite:dbname=$cache_file", '', '')
+	or die "Failed to init db: $!";
 
-print STDERR "Loading tables " unless $quiet;
-print STDERR "\n" if $verbose;
-
-load_tables($dbh, @ARGV);
-
-if ($dump) {
-	dump_tables(\*STDOUT, $dbh);
-} elsif (defined $macs) {
-	@$macs = split(/,/, join(',', @$macs));
-	if (scalar @$macs) {
-		find_macs(\*STDOUT, $dbh, $macs);
-	} else {
-		query_macs(\*STDOUT, $dbh, \*STDIN);
-	}
-} else {
-	interact($dbh);
+unless ($was_cached) {
+	prepare_db($dbh);
+	load_tables(\*STDERR, $dbh, @ARGV);
 }
+
+query_tables(\*STDOUT, \*STDIN, $dbh,
+	macs => $macs,
+	ports => $ports,
+	vlans => $vlans,
+	exlude_ports => $exclude_ports);
 
 exit 0;
 
 
-sub prepare_db () {
-	my $dbh = DBI->connect('dbi:SQLite:dbname=', '', '')
-		or die "Failed to init db: $!";
+sub prepare_db ($) {
+	my ($dbh) = @_;
 	$dbh->do(qq{
 		CREATE TABLE fwd(host, port, mac, vlan)
 	}) or die "Failed to create fwd table: $!";
@@ -75,26 +90,31 @@ sub prepare_db () {
 
 
 sub load_tables ($@) {
-	my ($dbh, @hosts) = @_;
+	my ($OUT, $dbh, @hosts) = @_;
+
+	print $OUT "Loading tables " unless $quiet;
+	print $OUT "\n" if $verbose;
+
+	$dbh->do('DELETE FROM fwd');
 	my @warnings;
 	foreach my $host (@hosts) {
+		print $OUT '.' unless $quiet or $verbose;
 		eval {
 			load_host_table($dbh, $host);
 		};
 		unless ($@) {
-			print STDERR "Table loaded for $host\n" if $verbose;
+			print $OUT "Table loaded for $host\n" if $verbose;
 		} else {
 			chomp $@;
 			push @warnings, "Failed to load table for $host: $@"
 				unless $verbose;
 			warn $@, "\n" if $verbose;
 		}
-		print STDERR '.' unless $quiet or $verbose;
 	}
 
-	print STDERR " done\n" unless $quiet or $verbose;
-	print STDERR "Tables loaded\n" if $verbose;
-	print STDERR join("\n", @warnings), "\n" if scalar @warnings;
+	print $OUT " done\n" unless $quiet or $verbose;
+	print $OUT "Tables loaded\n" if $verbose;
+	warn $_."\n" foreach @warnings;
 }
 
 
@@ -132,87 +152,104 @@ sub load_host_table ($) {
 }
 
 
-sub interact ($) {
-	my %interactive_commands = (
-		'help' => \&help,
-		'dump' => \&dump_tables,
-		'find' => \&find_macs,
-	);
+sub query_tables ($$$%) {
+	my ($OUT, $IN, $dbh, %filters) = @_;
 
-	my ($dbh) = @_;
-	my $term = new Term::ReadLine 'MACSearch';
-	my $prompt = '> ';
-	my $OUT = $term->OUT || \*STDOUT;
-	while (defined ($_ = $term->readline($prompt))) {
-		my ($command, $args) = split(/\s/, $_, 2);
-		$command or next;
-		$command eq 'quit' and last;
-		my $sub = $interactive_commands{$command}
-			or warn "Unknown command '$command'\n";
-		$sub or next;
-		eval {
-			$sub->($OUT, $dbh, $args);
-		};
-		$@ and warn $@;
-		$term->addhistory($_) if /\S/;
+	my @unbound;
+	my @conditions;
+	if (defined (my $macs = $filters{macs})) {
+		if (@$macs) {
+			@$macs = map { sanitise_mac($_) } @$macs;
+			push @conditions,'mac in ("'.join('","', @$macs).'")';
+		} else {
+			push @unbound, \&sanitise_mac;
+			push @conditions, 'mac = ?';
+		}
+	}
+	if (defined (my $ports = $filters{ports})) {
+		if (@$ports) {
+			@$ports = map { sanitise_port($_) } @$ports;
+			push @conditions,'port in ("'.join('","', @$ports).'")';
+		} else {
+			push @unbound, \&sanitise_port;
+			push @conditions, 'port = ?';
+		}
+	}
+	if (defined (my $vlans = $filters{vlans})) {
+		if (@$vlans) {
+			@$vlans = map { sanitise_vlan($_) } @$vlans;
+			push @conditions,'vlan in ("'.join('","', @$vlans).'")';
+		} else {
+			push @unbound, \&sanitise_vlan;
+			push @conditions, 'vlan = ?';
+		}
+	}
+	if (defined (my $exclude_ports = $filters{exlude_ports})) {
+		foreach (@$exclude_ports) {
+			my ($host, $port) = split(':');
+			$host = sanitise_host($host);
+			$port = sanitise_port($port);
+			push @conditions, qq{
+				NOT (host = "$host" AND port = "$port")
+			};
+		}
+	}
+
+	@conditions or @conditions = (1);
+	my $sth = $dbh->prepare('SELECT host, port, mac, vlan FROM fwd WHERE '.
+		join(' AND ', @conditions));
+	
+	unless (@unbound) {
+		$sth->execute();
+		output_fwd_table_query_results($OUT, $sth);
+		return;
+	}
+
+	while (<$IN>) {
+		chomp;
+		my @params = split(',');
+		my @binds = map { $$_[0]->($$_[1]) } zip(\@unbound, \@params);
+		$sth->execute(@binds);
+		output_fwd_table_query_results($OUT, $sth);
 	}
 }
 
 
-sub help ($) {
-	my ($OUT) = @_;
-	print $OUT <<EOM;
-commands:
-  help - display this text
-  dump - display all tables in CSV
-  find <mac> - display the switch, port and vlan a mac is visible on
-EOM
-}
-
-
-sub dump_tables ($$) {
-	my ($OUT, $dbh) = @_;
-	print $OUT join(',', 'Host', 'MAC', 'Port', 'VLAN'), "\n"
-		unless $quiet and $quiet > 1;
-	my $sth = $dbh->prepare(qq{
-		SELECT host, mac, port, vlan FROM fwd
-	});
-	$sth->execute();
+sub output_fwd_table_query_results ($$) {
+	my ($OUT, $sth) = @_;
+	print $OUT join(',', 'Host', 'Port', 'MAC', 'VLAN'), "\n"
+		unless $noheader;
+	my $found;
 	while (my @row = $sth->fetchrow_array) {
 		print $OUT join(',', @row), "\n";
+		$found = 1;
 	}
+	not $found and not $quiet and warn "No results for query\n";
 }
 
 
-sub find_macs ($$$;$) {
-	my ($OUT, $dbh, $macs, $noheader) = @_;
-	ref($macs) or $macs = [split(/,/, $macs)];
-	@$macs = map { sanitise_mac($_) } @$macs;
-	print $OUT join(',', 'MAC', 'Host', 'Port', 'VLAN'), "\n"
-		unless $noheader or ($quiet and $quiet > 1);
-	my $sth = $dbh->prepare(qq{
-		SELECT host, port, vlan FROM fwd WHERE mac=?
-	});
-	foreach my $mac (@$macs) {
-		$sth->execute($mac);
-		my $found = 0;
-		while (my @row = $sth->fetchrow_array) {
-			print $OUT join(',', $mac, @row), "\n";
-			$found = 1;
-		}
-		$found or $quiet or warn "$mac: not found\n";
+sub zip (@) {
+	my $max = 0;
+	do { $max = scalar @$_ if scalar @$_ > $max } foreach @_;
+	my @results;
+	for (my $i = 0; $i < $max; ++$i) {
+		push @results, [ map { $$_[$i] } @_ ];
 	}
+	return @results;
 }
 
 
-sub query_macs ($$$) {
-	my ($OUT, $dbh, $IN) = @_;
-	my $noheader = 0;
-	while (<$IN>) {
-		eval { find_macs($OUT, $dbh, [$_], $noheader) };
-		$@ and do { warn $@; next };
-		$noheader = 1;
-	}
+sub sanitise_host ($) {
+	my ($host) = @_;
+	$host =~ s/^\s*|\s*$//;
+	return $host;
+}
+
+sub sanitise_port ($) {
+	my ($port) = @_;
+	$port =~ /^\s*(\d+)\s*$/
+		or die "Invalid port '$port'\n";
+	return $1;
 }
 
 
@@ -229,6 +266,14 @@ sub sanitise_mac ($) {
 	$mac =~ /^[0-9a-f]{12}$/ or die "Invalid mac '$mac'\n";
 
 	return $mac;
+}
+
+
+sub sanitise_vlan ($) {
+	my ($vlan) = @_;
+	$vlan =~ /^\s*(\d+)\s*$/
+		or die "Invalid vlan '$vlan'\n";
+	return $1;
 }
 
 1;
