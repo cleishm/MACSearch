@@ -11,16 +11,19 @@ use Term::ReadLine;
 sub prepare_db ();
 sub load_tables ($@);
 sub interact ($);
+sub dump_tables ($$);
 sub find_macs ($$$;$);
 sub query_macs ($$$);
 
 my $quiet;
 my $verbose;
+my $dump;
 my $macs;
 Getopt::Long::Configure('bundling');
 GetOptions(
 	'q|quiet+' => \$quiet,
 	'v|verbose' => \$verbose,
+	'dump' => \$dump,
 	'm|mac:s@' => \$macs,
 ) or die "Invalid argument(s)\n";
 
@@ -29,6 +32,7 @@ unless (scalar @ARGV >= 1) {
 usage: $0 [options] hostname [hostname...]
  -q,--quiet            Silence all unnecessary output
  -v,--verbose          Additional output
+ --dump                Dump entire tables in CSV
  -m,--macs [mac,mac]   Search for the specified mac.
                        Reads from stdin if none specified.
 EOM
@@ -44,7 +48,9 @@ print STDERR "\n" if $verbose;
 
 load_tables($dbh, @ARGV);
 
-if (defined $macs) {
+if ($dump) {
+	dump_tables(\*STDOUT, $dbh);
+} elsif (defined $macs) {
 	@$macs = split(/,/, join(',', @$macs));
 	if (scalar @$macs) {
 		find_macs(\*STDOUT, $dbh, $macs);
