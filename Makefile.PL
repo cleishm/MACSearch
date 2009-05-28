@@ -10,7 +10,6 @@ WriteMakefile(
 			  DBI => 0,
 			  DBD::SQLite => 0,
 			  Getopt::Long => 0,
-			  Term::Readline => 0,
 			 },
     ($] >= 5.005 ?     ## Add these new keywords supported since 5.005
       (ABSTRACT       => 'Tool for using SNMP to query macs on switches',
