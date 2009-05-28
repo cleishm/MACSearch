@@ -1,0 +1,227 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use Net::SNMP;
+use Net::SNMP::Mixin qw/mixer init_mixins/;
+use DBI;
+use Getopt::Long;
+use Term::ReadLine;
+
+sub prepare_db ();
+sub load_tables ($@);
+sub interact ($);
+sub find_macs ($$$;$);
+sub query_macs ($$$);
+
+my $quiet;
+my $verbose;
+my $macs;
+Getopt::Long::Configure('bundling');
+GetOptions(
+	'q|quiet+' => \$quiet,
+	'v|verbose' => \$verbose,
+	'm|mac:s@' => \$macs,
+) or die "Invalid argument(s)\n";
+
+unless (scalar @ARGV >= 1) {
+	die <<EOM;
+usage: $0 [options] hostname [hostname...]
+ -q,--quiet            Silence all unnecessary output
+ -v,--verbose          Additional output
+ -m,--macs [mac,mac]   Search for the specified mac.
+                       Reads from stdin if none specified.
+EOM
+}
+
+$quiet and undef $verbose;
+
+
+my $dbh = prepare_db();
+
+print STDERR "Loading tables " unless $quiet;
+print STDERR "\n" if $verbose;
+
+load_tables($dbh, @ARGV);
+
+if (defined $macs) {
+	@$macs = split(/,/, join(',', @$macs));
+	if (scalar @$macs) {
+		find_macs(\*STDOUT, $dbh, $macs);
+	} else {
+		query_macs(\*STDOUT, $dbh, \*STDIN);
+	}
+} else {
+	interact($dbh);
+}
+
+exit 0;
+
+
+sub prepare_db () {
+	my $dbh = DBI->connect('dbi:SQLite:dbname=', '', '')
+		or die "Failed to init db: $!";
+	$dbh->do(qq{
+		CREATE TABLE fwd(host, port, mac, vlan)
+	}) or die "Failed to create fwd table: $!";
+	return $dbh;
+}
+
+
+sub load_tables ($@) {
+	my ($dbh, @hosts) = @_;
+	my @warnings;
+	foreach my $host (@hosts) {
+		eval {
+			load_host_table($dbh, $host);
+		};
+		unless ($@) {
+			print STDERR "Table loaded for $host\n" if $verbose;
+		} else {
+			chomp $@;
+			push @warnings, "Failed to load table for $host: $@"
+				unless $verbose;
+			warn $@, "\n" if $verbose;
+		}
+		print STDERR '.' unless $quiet or $verbose;
+	}
+
+	print STDERR " done\n" unless $quiet or $verbose;
+	print STDERR "Tables loaded\n" if $verbose;
+	print STDERR join("\n", @warnings), "\n" if scalar @warnings;
+}
+
+
+sub load_host_table ($) {
+	my ($dbh, $host) = @_;
+	my $session = Net::SNMP->session(
+		-hostname => $host,
+		-version => '2c' );
+	my $sth = $dbh->prepare(qq{
+		INSERT INTO fwd(host, port, mac, vlan) VALUES (?, ?, ?, ?)
+	});
+	eval {
+		$session->mixer('Net::SNMP::Mixin::Dot1qFdb');
+		$session->init_mixins();
+		snmp_dispatcher()   if $session->nonblocking;
+		die $session->error if $session->error;
+
+		my @table = $session->get_dot1q_fdb_entries()
+			or die "dot1qfdb query failed";
+		foreach my $entry (@table) {
+			$sth->execute(
+				$host,
+				$entry->{dot1dBasePort},
+				sanitise_mac($entry->{MacAddress}),
+				$entry->{vlanId},
+			);
+		}
+	};
+	if ($@) {
+		my $err = $@;
+		$session->close();
+		die $@;
+	}
+}
+
+
+sub interact ($) {
+	my %interactive_commands = (
+		'help' => \&help,
+		'dump' => \&dump_tables,
+		'find' => \&find_macs,
+	);
+
+	my ($dbh) = @_;
+	my $term = new Term::ReadLine 'MACSearch';
+	my $prompt = '> ';
+	my $OUT = $term->OUT || \*STDOUT;
+	while (defined ($_ = $term->readline($prompt))) {
+		my ($command, $args) = split(/\s/, $_, 2);
+		$command or next;
+		$command eq 'quit' and last;
+		my $sub = $interactive_commands{$command}
+			or warn "Unknown command '$command'\n";
+		$sub or next;
+		eval {
+			$sub->($OUT, $dbh, $args);
+		};
+		$@ and warn $@;
+		$term->addhistory($_) if /\S/;
+	}
+}
+
+
+sub help ($) {
+	my ($OUT) = @_;
+	print $OUT <<EOM;
+commands:
+  help - display this text
+  dump - display all tables in CSV
+  find <mac> - display the switch, port and vlan a mac is visible on
+EOM
+}
+
+
+sub dump_tables ($$) {
+	my ($OUT, $dbh) = @_;
+	print $OUT join(',', 'Host', 'MAC', 'Port', 'VLAN'), "\n"
+		unless $quiet and $quiet > 1;
+	my $sth = $dbh->prepare(qq{
+		SELECT host, mac, port, vlan FROM fwd
+	});
+	$sth->execute();
+	while (my @row = $sth->fetchrow_array) {
+		print $OUT join(',', @row), "\n";
+	}
+}
+
+
+sub find_macs ($$$;$) {
+	my ($OUT, $dbh, $macs, $noheader) = @_;
+	ref($macs) or $macs = [split(/,/, $macs)];
+	@$macs = map { sanitise_mac($_) } @$macs;
+	print $OUT join(',', 'MAC', 'Host', 'Port', 'VLAN'), "\n"
+		unless $noheader or ($quiet and $quiet > 1);
+	my $sth = $dbh->prepare(qq{
+		SELECT host, port, vlan FROM fwd WHERE mac=?
+	});
+	foreach my $mac (@$macs) {
+		$sth->execute($mac);
+		my $found = 0;
+		while (my @row = $sth->fetchrow_array) {
+			print $OUT join(',', $mac, @row), "\n";
+			$found = 1;
+		}
+		$found or $quiet or warn "$mac: not found\n";
+	}
+}
+
+
+sub query_macs ($$$) {
+	my ($OUT, $dbh, $IN) = @_;
+	my $noheader = 0;
+	while (<$IN>) {
+		eval { find_macs($OUT, $dbh, [$_], $noheader) };
+		$@ and do { warn $@; next };
+		$noheader = 1;
+	}
+}
+
+
+sub sanitise_mac ($) {
+	my ($mac) = @_;
+
+	$mac = lc $mac;
+	$mac =~ s/^\s+|\s+$//g;
+	$mac =~ s/[ -]/:/g;
+	$mac =~ s/^([0-9a-f]):/0$1:/;
+	$mac =~ s/:([0-9a-f])$/:0$1/;
+	$mac =~ s/:([0-9a-f]):/:0$1:/g;
+	($mac = lc $mac) =~ s/[: -]//g;
+	$mac =~ /^[0-9a-f]{12}$/ or die "Invalid mac '$mac'\n";
+
+	return $mac;
+}
+
+1;

@@ -1,0 +1,6 @@
+Revision history for Perl extension MACSearch.
+
+0.01  Thu May 28 10:09:33 2009
+	- original version; created by h2xs 1.23 with options
+		-X -n MACSearch
+

@@ -1,0 +1,30 @@
+MACSearch version 0.01
+======================
+
+Little tool to search compatible switches for the port a MAC has been seen on
+
+INSTALLATION
+
+To install this module type the following:
+
+   perl Makefile.PL
+   make
+   make test
+   make install
+
+DEPENDENCIES
+
+Net::SNMP
+Net::SNMP::Mixin::Dot1qFdb
+
+COPYRIGHT AND LICENCE
+
+Put the correct copyright and licence information here.
+
+Copyright (C) 2009 by Chris Leishman
+
+This library is free software; you can redistribute it and/or modify
+it under the same terms as Perl itself, either Perl version 5.8.9 or,
+at your option, any later version of Perl 5 you may have available.
+
+
