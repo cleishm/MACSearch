@@ -94,17 +94,18 @@ sub load_tables ($@) {
 
 sub load_host_table ($) {
 	my ($dbh, $host) = @_;
-	my $session = Net::SNMP->session(
+	my ($session, $error) = Net::SNMP->session(
 		-hostname => $host,
-		-version => '2c' );
+		-version => '2c');
+	$error and die "$error\n";
 	my $sth = $dbh->prepare(qq{
 		INSERT INTO fwd(host, port, mac, vlan) VALUES (?, ?, ?, ?)
 	});
 	eval {
 		$session->mixer('Net::SNMP::Mixin::Dot1qFdb');
 		$session->init_mixins();
-		snmp_dispatcher()   if $session->nonblocking;
-		die $session->error if $session->error;
+		$session->nonblocking and snmp_dispatcher();
+		$session->error and die $session->error."\n";
 
 		my @table = $session->get_dot1q_fdb_entries()
 			or die "dot1qfdb query failed";
@@ -119,8 +120,8 @@ sub load_host_table ($) {
 	};
 	if ($@) {
 		my $err = $@;
-		$session->close();
-		die $@;
+		eval { $session->close() };
+		die $err;
 	}
 }
 
